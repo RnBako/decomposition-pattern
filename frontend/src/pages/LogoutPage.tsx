@@ -1,0 +1,17 @@
+import { useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+
+export function LogoutPage() {
+  const { logout } = useAuth();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    void (async () => {
+      await logout();
+      navigate('/login', { replace: true });
+    })();
+  }, [logout, navigate]);
+
+  return <p className="text-center text-sm text-slate-500">Выход…</p>;
+}

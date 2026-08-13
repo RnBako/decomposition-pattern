@@ -1,0 +1,334 @@
+openapi: 3.1.0
+info:
+  title: notification-service API
+  version: 1.0.0
+  description: |
+    Bounded context: Notifications (Wishly).
+
+    Public REST API for the current user's in-app notifications:
+    list, mark read / mark all read, unread count, and health.
+
+    **Async consumers (not HTTP):** the service consumes Kafka events
+    `BookingCreated` and `BookingCancelled` (`wishly.booking.events`) and
+    commands `NotificationRequested` (`wishly.notification.commands`).
+    On each relevant message it persists an in-app `Notification` row and
+    performs best-effort email delivery via SMTP (Mailpit in local Compose).
+    SMTP/email is a side-effect of event handling — there is no separate
+    public email API.
+
+    Gateway mounts this service under `/api/notifications/*` (health may
+    be exposed as `/api/notifications/health` or a direct probe).
+
+servers:
+  - url: http://localhost:3004
+    description: Local development (notification-service)
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      operationId: getHealth
+      security: []
+      tags:
+        - System
+      responses:
+        '200':
+          description: Service is up
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /notifications:
+    get:
+      summary: List notifications for the current user
+      description: |
+        Returns in-app notifications for the authenticated recipient
+        (`recipient_id` = current user), newest first.
+      operationId: listNotifications
+      tags:
+        - Notifications
+      parameters:
+        - name: unread_only
+          in: query
+          required: false
+          description: If true, return only notifications with `read_at` null
+          schema:
+            type: boolean
+            default: false
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+        - name: offset
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+      responses:
+        '200':
+          description: Notification list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/NotificationListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/unread-count:
+    get:
+      summary: Unread notification count
+      description: |
+        Count of notifications for the current user where `read_at` is null.
+        Used for the menu / dashboard badge.
+      operationId: getUnreadCount
+      tags:
+        - Notifications
+      responses:
+        '200':
+          description: Unread count
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UnreadCountResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/read-all:
+    post:
+      summary: Mark all notifications as read
+      description: Sets `read_at` to now for all unread notifications of the current user.
+      operationId: markAllNotificationsRead
+      tags:
+        - Notifications
+      responses:
+        '200':
+          description: All unread marked as read
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/MarkAllReadResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /notifications/{notificationId}/read:
+    post:
+      summary: Mark a notification as read
+      description: |
+        Sets `read_at` for the given notification if it belongs to the
+        current user and is unread. Idempotent if already read.
+      operationId: markNotificationRead
+      tags:
+        - Notifications
+      parameters:
+        - $ref: '#/components/parameters/NotificationId'
+      responses:
+        '200':
+          description: Notification marked as read (or already read)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Notification'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  parameters:
+    NotificationId:
+      name: notificationId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Notification does not belong to the current user
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Notification not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+
+    NotificationType:
+      type: string
+      enum:
+        - booking_created
+        - booking_cancelled
+      description: Domain notification kinds for MVP
+
+    NotificationPayload:
+      type: object
+      required:
+        - wishlist_id
+        - gift_id
+        - booker_id
+      properties:
+        wishlist_id:
+          type: string
+          format: uuid
+          description: Logical ref to wishlist-service (no FK)
+        gift_id:
+          type: string
+          format: uuid
+          description: Logical ref to wishlist-service gift
+        booker_id:
+          type: string
+          format: uuid
+          description: Logical ref to auth-service user (booker)
+        booking_id:
+          type: string
+          format: uuid
+          description: Optional logical ref to booking-service booking
+        wishlist_title:
+          type: string
+          description: Optional snapshot for UI
+        gift_title:
+          type: string
+          description: Optional snapshot for UI
+        booker_display_name:
+          type: string
+          description: Optional snapshot when recipient may see booker name
+
+    ChannelFlags:
+      type: object
+      required:
+        - in_app
+        - email
+      description: |
+        Delivery channel status. `in_app` — row written for UI.
+        `email` — SMTP send succeeded; `email_error` set on failure (best-effort).
+      properties:
+        in_app:
+          type: boolean
+          description: In-app notification persisted
+        email:
+          type: boolean
+          description: Email successfully sent via SMTP
+        email_error:
+          type:
+            - string
+            - 'null'
+          description: Last SMTP error message if email delivery failed
+
+    Notification:
+      type: object
+      required:
+        - id
+        - recipient_id
+        - type
+        - payload
+        - channel_flags
+        - read_at
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        recipient_id:
+          type: string
+          format: uuid
+          description: Logical ref to auth-service users.id
+        type:
+          $ref: '#/components/schemas/NotificationType'
+        payload:
+          $ref: '#/components/schemas/NotificationPayload'
+        channel_flags:
+          $ref: '#/components/schemas/ChannelFlags'
+        read_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: Null when unread
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    NotificationListResponse:
+      type: object
+      required:
+        - items
+        - total
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Notification'
+        total:
+          type: integer
+          minimum: 0
+          description: Total matching rows (before limit/offset)
+
+    UnreadCountResponse:
+      type: object
+      required:
+        - count
+      properties:
+        count:
+          type: integer
+          minimum: 0
+          example: 3
+
+    MarkAllReadResponse:
+      type: object
+      required:
+        - updated
+      properties:
+        updated:
+          type: integer
+          minimum: 0
+          description: Number of notifications that were marked read in this call
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+security:
+  - bearerAuth: []

@@ -1,0 +1,276 @@
+# Wishly MVP — local Docker Compose
+#
+# PostgreSQL choice: ONE postgres container with FOUR databases
+# (wishly_auth, wishly_wishlist, wishly_booking, wishly_notification)
+# created by postgres/init-databases.sql. Simpler ops for local MVP while
+# keeping Database-per-Service (separate DBs, no cross-DB FK).
+#
+# Start from this directory:
+#   cp .env.example .env
+#   docker compose up --build
+#
+# Gateway:  http://localhost:18080  (host 8080 often busy — mapped to 18080)
+# Mailpit:  http://localhost:8025  (SMTP :1025)
+
+name: wishly
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wishly}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wishly}
+      POSTGRES_DB: ${POSTGRES_DB:-postgres}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'pg_isready -U $$POSTGRES_USER -d wishly_auth && pg_isready -U $$POSTGRES_USER -d wishly_wishlist && pg_isready -U $$POSTGRES_USER -d wishly_booking && pg_isready -U $$POSTGRES_USER -d wishly_notification',
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+    networks:
+      - wishly-net
+
+  # Apache Kafka KRaft (single node) for local MVP
+  kafka:
+    image: apache/kafka:3.8.1
+    environment:
+      KAFKA_NODE_ID: '1'
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: '1'
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: '1'
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: '0'
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qk
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          '/opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --list >/dev/null 2>&1 || exit 1',
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 60s
+    networks:
+      - wishly-net
+
+  mailpit:
+    image: axllent/mailpit:v1.21
+    ports:
+      - '8025:8025'
+      - '1025:1025'
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:8025/api/v1/info >/dev/null || exit 1']
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 5s
+    networks:
+      - wishly-net
+
+  auth-service:
+    build: ./auth-service
+    environment:
+      PORT: '3001'
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wishly}:${POSTGRES_PASSWORD:-wishly}@postgres:5432/wishly_auth
+      JWT_SECRET: ${JWT_SECRET:-change-me-shared-local-secret}
+      JWT_EXPIRES_IN: ${JWT_EXPIRES_IN:-86400}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@wishly.local}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-admin-change-me}
+      ADMIN_DISPLAY_NAME: ${ADMIN_DISPLAY_NAME:-Admin}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_CLIENT_ID: auth-service
+      KAFKA_TOPIC_AUTH_EVENTS: wishly.auth.events
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:3001/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    networks:
+      - wishly-net
+
+  wishlist-service:
+    build: ./wishlist-service
+    environment:
+      PORT: '3002'
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wishly}:${POSTGRES_PASSWORD:-wishly}@postgres:5432/wishly_wishlist
+      JWT_SECRET: ${JWT_SECRET:-change-me-shared-local-secret}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_CLIENT_ID: wishlist-service
+      KAFKA_TOPIC: wishly.wishlist.events
+      UPLOAD_DIR: /data/uploads
+      PUBLIC_MEDIA_BASE: /media
+    volumes:
+      - wishlist-uploads:/data/uploads
+    # Migrations are not run on process start in this service
+    command:
+      [
+        'sh',
+        '-c',
+        'node dist/db/migrate.js && node dist/server.js',
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:3002/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - wishly-net
+
+  booking-service:
+    build: ./booking-service
+    environment:
+      PORT: '3003'
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wishly}:${POSTGRES_PASSWORD:-wishly}@postgres:5432/wishly_booking
+      JWT_SECRET: ${JWT_SECRET:-change-me-shared-local-secret}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_CLIENT_ID: booking-service
+      KAFKA_BOOKING_EVENTS_TOPIC: wishly.booking.events
+      KAFKA_NOTIFICATION_COMMANDS_TOPIC: wishly.notification.commands
+    command:
+      [
+        'sh',
+        '-c',
+        'node dist/db/migrate.js && node dist/server.js',
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:3003/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - wishly-net
+
+  notification-service:
+    build: ./notification-service
+    environment:
+      PORT: '3004'
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-wishly}:${POSTGRES_PASSWORD:-wishly}@postgres:5432/wishly_notification
+      JWT_SECRET: ${JWT_SECRET:-change-me-shared-local-secret}
+      KAFKA_BROKERS: ${KAFKA_BROKERS:-kafka:9092}
+      KAFKA_CLIENT_ID: notification-service
+      KAFKA_GROUP_ID: notification-service
+      KAFKA_BOOKING_EVENTS_TOPIC: wishly.booking.events
+      KAFKA_NOTIFICATION_COMMANDS_TOPIC: wishly.notification.commands
+      KAFKA_DISABLED: 'false'
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@wishly.local}
+      SMTP_SECURE: ${SMTP_SECURE:-false}
+    command:
+      [
+        'sh',
+        '-c',
+        'node dist/db/migrate.js && node dist/server.js',
+      ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+      mailpit:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:3004/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 40s
+    networks:
+      - wishly-net
+
+  api-gateway:
+    build: ./api-gateway
+    ports:
+      - '18080:8080'
+    environment:
+      PORT: '8080'
+      NODE_ENV: production
+      AUTH_SERVICE_URL: http://auth-service:3001
+      WISHLIST_SERVICE_URL: http://wishlist-service:3002
+      BOOKING_SERVICE_URL: http://booking-service:3003
+      NOTIFICATION_SERVICE_URL: http://notification-service:3004
+      JWT_SECRET: ${JWT_SECRET:-change-me-shared-local-secret}
+      JWT_VALIDATE_AT_EDGE: ${JWT_VALIDATE_AT_EDGE:-true}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:5173,http://localhost:4173,http://localhost:3000,http://localhost}
+    depends_on:
+      auth-service:
+        condition: service_healthy
+      wishlist-service:
+        condition: service_healthy
+      booking-service:
+        condition: service_healthy
+      notification-service:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          'CMD-SHELL',
+          'node -e "fetch(\"http://127.0.0.1:8080/health\").then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"',
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+    networks:
+      - wishly-net
+
+networks:
+  wishly-net:
+    driver: bridge
+
+volumes:
+  postgres-data:
+  wishlist-uploads:

@@ -1,0 +1,1425 @@
+openapi: 3.1.0
+info:
+  title: wishlist-service API
+  version: 1.0.0
+  description: |
+    Wishlist Catalog bounded context (Wishly MVP).
+
+    Owns wishlists, categories, gifts (incl. images), share links, and comments.
+    Database: `wishly_wishlist`. Cross-service refs are logical UUIDs (no FK).
+
+    **Gateway:** mounted under `/api/*` (e.g. `/api/wishlists`, `/api/share/{token}`, `/api/media/{key}`).
+    Service paths below are without the `/api` prefix.
+
+    **Auth:** JWT via gateway; internal calls may receive `X-User-Id` / `X-User-Role`.
+    Owner = wishlist.owner_id == current user. Admin (`role=admin`) may soft-delete/restore any wishlist/gift.
+
+    **MVP limits:** ≤20 wishlists per user; ≤200 gifts per wishlist; image upload ≤5 MB (jpeg/png/webp).
+
+    **Public share:** `GET /share/{token}` returns catalog + denormalized occupancy (`is_occupied`)
+    **without booker names**. Comments are never exposed on public share.
+
+    ## Kafka events (published conceptually)
+
+    Topic: `wishly.wishlist.events` (key = aggregate id).
+
+    | Event | When | Payload (conceptual) |
+    |-------|------|----------------------|
+    | `WishlistShared` | Share link created or re-activated | `wishlist_id`, `share_link_id`, `token`, `owner_id`, `occurred_at` |
+    | `ShareLinkRevoked` | Share link revoked | `wishlist_id`, `share_link_id`, `token`, `owner_id`, `occurred_at` |
+    | `GiftSoftDeleted` | Gift soft-deleted (owner/admin) | `gift_id`, `wishlist_id`, `owner_id`, `deleted_by_id`, `occurred_at` |
+    | `WishlistSoftDeleted` | Wishlist soft-deleted (owner/admin) | `wishlist_id`, `owner_id`, `deleted_by_id`, `occurred_at` |
+
+    Consumers (see architecture): booking-service, notification-service (as needed).
+
+servers:
+  - url: http://localhost:3002
+    description: wishlist-service local (direct)
+  - url: http://localhost:3000/api
+    description: via api-gateway
+
+tags:
+  - name: Health
+  - name: Wishlists
+  - name: Categories
+  - name: Gifts
+  - name: ShareLinks
+  - name: Comments
+  - name: Media
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Health check
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /wishlists:
+    get:
+      tags: [Wishlists]
+      summary: List current user's wishlists
+      operationId: listWishlists
+      description: |
+        Returns wishlists owned by the authenticated user.
+        Soft-deleted are hidden unless `include_deleted=true`.
+      parameters:
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Wishlist list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/WishlistSummary'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    post:
+      tags: [Wishlists]
+      summary: Create wishlist
+      operationId: createWishlist
+      description: |
+        Creates a wishlist for the current user.
+        Enforces limit: max **20** wishlists per `owner_id` (counting non-deleted).
+        Validates `booking_deadline` ≤ `event_date`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WishlistCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wishlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '409':
+          description: Wishlist limit reached (20)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    get:
+      tags: [Wishlists]
+      summary: Get wishlist details
+      operationId: getWishlist
+      description: |
+        Owner (or Admin) detail view. Includes categories, gifts (non-deleted by default),
+        and active share link metadata. Booking booker names are **not** owned by this service —
+        gateway/BFF merges booking-service data for owner UI.
+      parameters:
+        - $ref: '#/components/parameters/IncludeDeletedGifts'
+      responses:
+        '200':
+          description: Wishlist with nested catalog
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WishlistDetail'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Wishlists]
+      summary: Update wishlist
+      operationId: updateWishlist
+      description: Owner only. Soft-deleted wishlist cannot be updated without restore. Validates deadline ≤ event_date.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WishlistUpdate'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wishlist'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Wishlist is soft-deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Wishlists]
+      summary: Soft-delete wishlist
+      operationId: softDeleteWishlist
+      description: |
+        Sets `deleted_at`. Owner of own wishlist, or Admin.
+        Publishes Kafka event **`WishlistSoftDeleted`**.
+        Soft-deleted wishlists are hidden from ordinary lists and public share.
+      responses:
+        '204':
+          description: Soft-deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    post:
+      tags: [Wishlists]
+      summary: Restore soft-deleted wishlist
+      operationId: restoreWishlist
+      description: Clears `deleted_at`. Owner (own) or Admin. Subject to 20-wishlist limit after restore.
+      responses:
+        '200':
+          description: Restored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wishlist'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Cannot restore (not deleted, or would exceed 20 wishlists)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}/categories:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    get:
+      tags: [Categories]
+      summary: List categories
+      operationId: listCategories
+      responses:
+        '200':
+          description: Categories ordered by sort_order
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Category'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Categories]
+      summary: Create category
+      operationId: createCategory
+      description: Owner only. `name` unique within wishlist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Duplicate category name in wishlist
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}/categories/{categoryId}:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/CategoryId'
+    patch:
+      tags: [Categories]
+      summary: Update category
+      operationId: updateCategory
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CategoryUpdate'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Category'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Duplicate category name
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Categories]
+      summary: Delete category
+      operationId: deleteCategory
+      description: |
+        Hard delete of category row. Gifts with this `category_id` are set to `category_id = null`.
+      responses:
+        '204':
+          description: Deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/gifts:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    get:
+      tags: [Gifts]
+      summary: List gifts in wishlist
+      operationId: listGifts
+      description: |
+        Soft-deleted gifts hidden unless `include_deleted=true` (trash UI).
+        Supports optional pagination for long lists.
+      parameters:
+        - $ref: '#/components/parameters/IncludeDeleted'
+        - name: category_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+          description: Filter by category; omit for all; use `uncategorized=true` for null category
+        - name: uncategorized
+          in: query
+          required: false
+          schema:
+            type: boolean
+            default: false
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Gift page
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GiftListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Gifts]
+      summary: Create gift
+      operationId: createGift
+      description: |
+        Owner only. Max **200** non-deleted gifts per wishlist.
+        Currency is RUB only. Image via `image_url` and/or later multipart upload.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GiftCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Gift limit reached (200) or wishlist soft-deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}/gifts/{giftId}:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/GiftId'
+    get:
+      tags: [Gifts]
+      summary: Get gift
+      operationId: getGift
+      responses:
+        '200':
+          description: Gift
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    patch:
+      tags: [Gifts]
+      summary: Update gift
+      operationId: updateGift
+      description: Owner only. Soft-deleted gift cannot be updated without restore.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/GiftUpdate'
+      responses:
+        '200':
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Gift is soft-deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [Gifts]
+      summary: Soft-delete gift
+      operationId: softDeleteGift
+      description: |
+        Sets `deleted_at`. Owner or Admin.
+        Publishes Kafka event **`GiftSoftDeleted`**.
+      responses:
+        '204':
+          description: Soft-deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/gifts/{giftId}/restore:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/GiftId'
+    post:
+      tags: [Gifts]
+      summary: Restore soft-deleted gift
+      operationId: restoreGift
+      description: Clears `deleted_at`. Owner or Admin. Subject to 200-gift limit after restore.
+      responses:
+        '200':
+          description: Restored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Cannot restore (not deleted, or would exceed 200 gifts)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}/gifts/{giftId}/image:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/GiftId'
+    post:
+      tags: [Gifts]
+      summary: Upload gift image (multipart)
+      operationId: uploadGiftImage
+      description: |
+        Multipart file upload. Max **5 MB**. Allowed types: `image/jpeg`, `image/png`, `image/webp`.
+        Stores file on local Docker volume; sets `image_storage_key` and derived public `image_url`
+        via gateway `/api/media/{key}`. May clear or keep external `image_url` per request flag.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: Image file ≤5MB
+                clear_external_url:
+                  type: boolean
+                  default: true
+                  description: If true, clears gift.image_url when upload succeeds
+      responses:
+        '200':
+          description: Image stored
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '400':
+          description: Invalid type or size >5MB
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags: [Gifts]
+      summary: Remove uploaded gift image
+      operationId: deleteGiftImage
+      description: Clears `image_storage_key` and deletes file from volume. Does not clear external `image_url` unless requested.
+      parameters:
+        - name: clear_external_url
+          in: query
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: Image removed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Gift'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/share-link:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    get:
+      tags: [ShareLinks]
+      summary: Get active share link for wishlist
+      operationId: getShareLink
+      description: Owner only. Returns current active link or 404 if none.
+      responses:
+        '200':
+          description: Active share link
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLink'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [ShareLinks]
+      summary: Create or rotate share link
+      operationId: createShareLink
+      description: |
+        Owner only. Creates a new active share link (cryptographically random token).
+        If an active link exists and `rotate=true`, previous link is revoked first.
+        Publishes Kafka event **`WishlistShared`**.
+      parameters:
+        - name: rotate
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: If true, revoke existing active link before creating a new one
+      responses:
+        '201':
+          description: Share link created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ShareLink'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Active link already exists (pass rotate=true)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+    delete:
+      tags: [ShareLinks]
+      summary: Revoke active share link
+      operationId: revokeShareLink
+      description: |
+        Owner (or Admin). Sets `is_active=false`, `revoked_at=now()`.
+        Publishes Kafka event **`ShareLinkRevoked`**.
+        Public `GET /share/{token}` becomes unavailable (404).
+      responses:
+        '204':
+          description: Revoked
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /share/{token}:
+    get:
+      tags: [ShareLinks]
+      summary: Public wishlist view by share token
+      operationId: getPublicShareByToken
+      security: []
+      description: |
+        **Public** endpoint (no JWT required).
+
+        Returns wishlist catalog for an **active** share token:
+        - wishlist title, description, event_date, booking_deadline
+        - categories and non-deleted gifts (image URLs, price RUB, notes as owner wrote)
+        - denormalized `is_occupied` per gift when available (from booking events / local flag)
+        - **MUST NOT** include booker names, booker ids, or comments
+
+        Soft-deleted wishlist/gift hidden. Revoked/inactive token → 404.
+        Booking create/cancel is owned by booking-service; gateway may enrich occupancy.
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+      responses:
+        '200':
+          description: Public share view (no booker PII)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicShareView'
+        '404':
+          description: Token invalid, revoked, or wishlist soft-deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /wishlists/{wishlistId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+    get:
+      tags: [Comments]
+      summary: List wishlist-level comments
+      operationId: listWishlistComments
+      description: |
+        Owner only (authenticated context of own wishlist). Admin may list for moderation.
+        Soft-deleted comments excluded unless `include_deleted=true` (admin).
+      parameters:
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Comments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Comments]
+      summary: Create wishlist-level comment
+      operationId: createWishlistComment
+      description: |
+        **Owner only** — comments on own wishlist. Not available on public share.
+        Snapshots `author_display_name` at create time.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/gifts/{giftId}/comments:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/GiftId'
+    get:
+      tags: [Comments]
+      summary: List gift-level comments
+      operationId: listGiftComments
+      description: Owner only (own wishlist). Admin may list for moderation.
+      parameters:
+        - $ref: '#/components/parameters/IncludeDeleted'
+      responses:
+        '200':
+          description: Comments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [items]
+                properties:
+                  items:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Comment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    post:
+      tags: [Comments]
+      summary: Create gift-level comment
+      operationId: createGiftComment
+      description: **Owner only** on own gift. Sets both `wishlist_id` and `gift_id`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CommentCreate'
+      responses:
+        '201':
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Comment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /wishlists/{wishlistId}/comments/{commentId}:
+    parameters:
+      - $ref: '#/components/parameters/WishlistId'
+      - $ref: '#/components/parameters/CommentId'
+    delete:
+      tags: [Comments]
+      summary: Soft-delete comment
+      operationId: softDeleteComment
+      description: Author (owner) or Admin moderation. Sets `deleted_at`.
+      responses:
+        '204':
+          description: Soft-deleted
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /media/{storageKey}:
+    get:
+      tags: [Media]
+      summary: Serve stored gift image
+      operationId: getMedia
+      security: []
+      description: |
+        Serves file from local Docker volume by `image_storage_key`.
+        Typically exposed via gateway as `/api/media/{storageKey}`.
+      parameters:
+        - name: storageKey
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        '200':
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  parameters:
+    WishlistId:
+      name: wishlistId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CategoryId:
+      name: categoryId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    GiftId:
+      name: giftId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    CommentId:
+      name: commentId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+    IncludeDeleted:
+      name: include_deleted
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+      description: Include soft-deleted entities (trash / admin views)
+    IncludeDeletedGifts:
+      name: include_deleted_gifts
+      in: query
+      required: false
+      schema:
+        type: boolean
+        default: false
+
+  responses:
+    BadRequest:
+      description: Validation error
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Missing or invalid JWT
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Authenticated but not allowed
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        details:
+          type: object
+          additionalProperties: true
+
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    WishlistCreate:
+      type: object
+      required: [title, event_date, booking_deadline]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 4000
+          nullable: true
+        event_date:
+          type: string
+          format: date
+        booking_deadline:
+          type: string
+          format: date-time
+          description: Must be ≤ event_date (end of event day allowed)
+
+    WishlistUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        description:
+          type: string
+          maxLength: 4000
+          nullable: true
+        event_date:
+          type: string
+          format: date
+        booking_deadline:
+          type: string
+          format: date-time
+
+    Wishlist:
+      type: object
+      required:
+        - id
+        - owner_id
+        - title
+        - event_date
+        - booking_deadline
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        owner_id:
+          type: string
+          format: uuid
+          description: Logical ref to auth-service users.id (no FK)
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        event_date:
+          type: string
+          format: date
+        booking_deadline:
+          type: string
+          format: date-time
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    WishlistSummary:
+      allOf:
+        - $ref: '#/components/schemas/Wishlist'
+        - type: object
+          properties:
+            gifts_count:
+              type: integer
+              minimum: 0
+              description: Non-deleted gifts
+            categories_count:
+              type: integer
+              minimum: 0
+            has_active_share_link:
+              type: boolean
+
+    WishlistDetail:
+      allOf:
+        - $ref: '#/components/schemas/Wishlist'
+        - type: object
+          properties:
+            categories:
+              type: array
+              items:
+                $ref: '#/components/schemas/Category'
+            gifts:
+              type: array
+              items:
+                $ref: '#/components/schemas/Gift'
+            share_link:
+              allOf:
+                - $ref: '#/components/schemas/ShareLink'
+              nullable: true
+
+    CategoryCreate:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        sort_order:
+          type: integer
+          default: 0
+
+    CategoryUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 120
+        sort_order:
+          type: integer
+
+    Category:
+      type: object
+      required: [id, wishlist_id, name, sort_order, created_at, updated_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+        wishlist_id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        sort_order:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    GiftCreate:
+      type: object
+      required: [title, url, price]
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        price:
+          type: number
+          minimum: 0
+          description: Amount in RUB
+        currency:
+          type: string
+          enum: [RUB]
+          default: RUB
+        category_id:
+          type: string
+          format: uuid
+          nullable: true
+        image_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          nullable: true
+          description: External image URL (alternative to multipart upload)
+        notes:
+          type: string
+          maxLength: 4000
+          nullable: true
+
+    GiftUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+          minLength: 1
+          maxLength: 255
+        url:
+          type: string
+          format: uri
+          maxLength: 2048
+        price:
+          type: number
+          minimum: 0
+        currency:
+          type: string
+          enum: [RUB]
+        category_id:
+          type: string
+          format: uuid
+          nullable: true
+        image_url:
+          type: string
+          format: uri
+          maxLength: 2048
+          nullable: true
+        notes:
+          type: string
+          maxLength: 4000
+          nullable: true
+
+    Gift:
+      type: object
+      required:
+        - id
+        - wishlist_id
+        - title
+        - url
+        - price
+        - currency
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        wishlist_id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+          nullable: true
+        title:
+          type: string
+        url:
+          type: string
+          format: uri
+        price:
+          type: number
+        currency:
+          type: string
+          enum: [RUB]
+          default: RUB
+        image_url:
+          type: string
+          format: uri
+          nullable: true
+          description: External URL and/or resolved media URL for clients
+        image_storage_key:
+          type: string
+          nullable: true
+          description: Key in local volume; public path /media/{key}
+        notes:
+          type: string
+          nullable: true
+        is_occupied:
+          type: boolean
+          description: |
+            Optional denormalized occupancy from BookingCreated/Cancelled consumers.
+            Never accompanied by booker identity in this service's DTOs.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    GiftListResponse:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Gift'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+
+    ShareLink:
+      type: object
+      required:
+        - id
+        - wishlist_id
+        - token
+        - is_active
+        - public_path
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        wishlist_id:
+          type: string
+          format: uuid
+        token:
+          type: string
+        is_active:
+          type: boolean
+        public_path:
+          type: string
+          description: SPA path e.g. /w/{token}
+          example: /w/abc123token
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        revoked_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    PublicShareView:
+      type: object
+      required: [wishlist, categories, gifts]
+      description: |
+        Public DTO — **no booker names**, **no comments**, **no owner private admin fields**.
+      properties:
+        wishlist:
+          type: object
+          required: [id, title, event_date, booking_deadline]
+          properties:
+            id:
+              type: string
+              format: uuid
+            title:
+              type: string
+            description:
+              type: string
+              nullable: true
+            event_date:
+              type: string
+              format: date
+            booking_deadline:
+              type: string
+              format: date-time
+            booking_open:
+              type: boolean
+              description: True if now < booking_deadline and wishlist not deleted
+        categories:
+          type: array
+          items:
+            $ref: '#/components/schemas/Category'
+        gifts:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicGift'
+
+    PublicGift:
+      type: object
+      required: [id, title, url, price, currency, is_occupied]
+      description: Gift in public share — occupancy flag only, never booker identity
+      properties:
+        id:
+          type: string
+          format: uuid
+        category_id:
+          type: string
+          format: uuid
+          nullable: true
+        title:
+          type: string
+        url:
+          type: string
+          format: uri
+        price:
+          type: number
+        currency:
+          type: string
+          enum: [RUB]
+        image_url:
+          type: string
+          format: uri
+          nullable: true
+        notes:
+          type: string
+          nullable: true
+        is_occupied:
+          type: boolean
+          description: true = booked (status only; no booker name)
+
+    CommentCreate:
+      type: object
+      required: [body]
+      properties:
+        body:
+          type: string
+          minLength: 1
+          maxLength: 4000
+
+    Comment:
+      type: object
+      required:
+        - id
+        - author_id
+        - body
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        author_id:
+          type: string
+          format: uuid
+          description: Logical ref to auth-service users.id
+        author_display_name:
+          type: string
+          description: Snapshot at create time
+        wishlist_id:
+          type: string
+          format: uuid
+          nullable: true
+        gift_id:
+          type: string
+          format: uuid
+          nullable: true
+        body:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+        deleted_at:
+          type: string
+          format: date-time
+          nullable: true
+
+security:
+  - bearerAuth: []

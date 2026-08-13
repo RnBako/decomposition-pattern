@@ -1,0 +1,669 @@
+openapi: 3.1.0
+info:
+  title: booking-service API
+  version: 1.0.0
+  description: |
+    Bounded context: Booking (Wishly).
+
+    Aggregate: Booking — не более одной активной брони на `gift_id`.
+
+    Snapshot-поля при создании (денормализация, без FK):
+    `gift_title`, `wishlist_id`, `wishlist_owner_id`, `booking_deadline`,
+    `booker_display_name` (+ `booker_email` для owner/admin DTO).
+
+    Правила:
+    - Создать бронь: только зарегистрированный пользователь; не владелец подарка
+      (`booker_id != wishlist_owner_id`); до `booking_deadline`; gift свободен.
+    - Отмена: Admin — любая; Owner вишлиста — бронь на своих подарках;
+      booker — свою бронь до `booking_deadline`.
+    - Публичный статус по gift ids — без имён booker.
+    - Список по wishlist (owner/admin) — с именами booker.
+
+    Kafka (после успешного commit):
+    - Topic `wishly.booking.events`: `BookingCreated`, `BookingCancelled`
+    - Topic `wishly.notification.commands`: `NotificationRequested`
+
+    Gateway: `/api/bookings/*` → этот сервис (пути ниже — upstream без префикса `/api`).
+
+servers:
+  - url: http://localhost:3003
+    description: Local booking-service
+
+tags:
+  - name: health
+  - name: bookings
+  - name: public
+  - name: admin
+  - name: events
+
+paths:
+  /health:
+    get:
+      tags: [health]
+      summary: Health check
+      operationId: getHealth
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /bookings:
+    post:
+      tags: [bookings]
+      summary: Create booking
+      description: |
+        Создаёт активную бронь на подарок.
+        Требует JWT. Запрещено бронировать свой подарок (`wishlist_owner_id` из body
+        должен отличаться от текущего пользователя). При конфликте активной брони — 409.
+        После commit публикует `BookingCreated` и `NotificationRequested` (owner).
+      operationId: createBooking
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateBookingRequest'
+      responses:
+        '201':
+          description: Booking created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Owner cannot book own gift / forbidden
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Gift already has an active booking
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '422':
+          description: Booking deadline passed or validation failed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+    get:
+      tags: [bookings]
+      summary: List bookings for wishlist (owner/admin)
+      description: |
+        Список броней вишлиста с именами booker.
+        Доступ: владелец вишлиста (`wishlist_owner_id` совпадает с текущим user)
+        или Admin. Для публичного share использовать `GET /bookings/status`.
+      operationId: listBookingsByWishlist
+      parameters:
+        - name: wishlist_id
+          in: query
+          required: true
+          schema:
+            type: string
+            format: uuid
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+          description: Фильтр; по умолчанию все статусы
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Bookings with booker identity (owner/admin)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /bookings/me:
+    get:
+      tags: [bookings]
+      summary: List my bookings
+      description: Брони текущего пользователя как booker (активные и/или отменённые).
+      operationId: listMyBookings
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Current user's bookings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /bookings/status:
+    get:
+      tags: [public]
+      summary: Public booking status by gift ids
+      description: |
+        Occupancy для share-страницы: занят / свободен **без** имён booker
+        и без `booker_id` / `booker_email` / `booker_display_name`.
+        Auth необязателен.
+      operationId: getPublicBookingStatus
+      security: []
+      parameters:
+        - name: gift_ids
+          in: query
+          required: true
+          description: Список UUID подарков через запятую (до 200)
+          schema:
+            type: string
+            example: "550e8400-e29b-41d4-a716-446655440000,550e8400-e29b-41d4-a716-446655440001"
+      responses:
+        '200':
+          description: Status map without booker PII
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PublicBookingStatusResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+
+  /bookings/{bookingId}/cancel:
+    post:
+      tags: [bookings]
+      summary: Cancel booking (admin / owner / booker)
+      description: |
+        Правила отмены:
+        - Admin — любая активная бронь;
+        - Owner вишлиста (`wishlist_owner_id` == current user) — бронь на своих подарках;
+        - Booker — свою бронь, только если сейчас ≤ snapshot `booking_deadline`.
+        После commit: `BookingCancelled` + `NotificationRequested`.
+      operationId: cancelBooking
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Booking cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Not allowed to cancel (role/deadline)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /admin/bookings:
+    get:
+      tags: [admin]
+      summary: Admin list bookings
+      description: Операционный список броней с именами booker. Только `role=admin`.
+      operationId: adminListBookings
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            $ref: '#/components/schemas/BookingStatus'
+        - name: q
+          in: query
+          required: false
+          description: Поиск по booker_display_name, booker_email, gift_title
+          schema:
+            type: string
+        - name: wishlist_id
+          in: query
+          required: false
+          schema:
+            type: string
+            format: uuid
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        '200':
+          description: Admin booking list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/BookingListResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+
+  /admin/bookings/{bookingId}/cancel:
+    post:
+      tags: [admin]
+      summary: Admin cancel booking
+      description: |
+        Принудительная отмена Admin. Эквивалентна cancel с ролью admin;
+        отдельный путь для модерации `/admin`.
+        События: `BookingCancelled`, `NotificationRequested`.
+      operationId: adminCancelBooking
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Booking cancelled by admin
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: Already cancelled
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  parameters:
+    BookingId:
+      name: bookingId
+      in: path
+      required: true
+      schema:
+        type: string
+        format: uuid
+
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  responses:
+    BadRequest:
+      description: Bad request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Unauthorized:
+      description: Unauthorized
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+    NotFound:
+      description: Not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status]
+      properties:
+        status:
+          type: string
+          example: ok
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+        code:
+          type: string
+          description: Machine-readable code (e.g. GIFT_ALREADY_BOOKED, DEADLINE_PASSED)
+
+    BookingStatus:
+      type: string
+      enum: [active, cancelled]
+
+    CreateBookingRequest:
+      type: object
+      required:
+        - gift_id
+        - gift_title
+        - wishlist_id
+        - wishlist_owner_id
+        - booking_deadline
+      properties:
+        gift_id:
+          type: string
+          format: uuid
+          description: Logical ref → wishlist-service.gifts.id
+        gift_title:
+          type: string
+          maxLength: 500
+          description: Snapshot of gift title at booking time
+        wishlist_id:
+          type: string
+          format: uuid
+          description: Snapshot / logical ref → wishlist-service.wishlists.id
+        wishlist_owner_id:
+          type: string
+          format: uuid
+          description: Snapshot / logical ref → auth-service.users.id (owner)
+        booking_deadline:
+          type: string
+          format: date-time
+          description: Snapshot of wishlist booking_deadline; validated server-side (now ≤ deadline)
+
+    Booking:
+      type: object
+      required:
+        - id
+        - gift_id
+        - booker_id
+        - status
+        - gift_title
+        - wishlist_id
+        - wishlist_owner_id
+        - booking_deadline
+        - booker_display_name
+        - created_at
+        - updated_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        gift_id:
+          type: string
+          format: uuid
+        booker_id:
+          type: string
+          format: uuid
+        status:
+          $ref: '#/components/schemas/BookingStatus'
+        gift_title:
+          type: string
+        wishlist_id:
+          type: string
+          format: uuid
+        wishlist_owner_id:
+          type: string
+          format: uuid
+        booking_deadline:
+          type: string
+          format: date-time
+        booker_display_name:
+          type: string
+          description: Snapshot; omit/redact on public status endpoint
+        booker_email:
+          type: string
+          format: email
+          description: Snapshot for owner/admin; not in public status
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        cancelled_by_id:
+          type: string
+          format: uuid
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    BookingListResponse:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Booking'
+        page:
+          type: integer
+        page_size:
+          type: integer
+        total:
+          type: integer
+
+    PublicGiftBookingStatus:
+      type: object
+      required: [gift_id, is_booked]
+      properties:
+        gift_id:
+          type: string
+          format: uuid
+        is_booked:
+          type: boolean
+          description: true если есть активная бронь
+        booking_id:
+          type: string
+          format: uuid
+          nullable: true
+          description: id активной брони (без booker PII); null если свободен
+        status:
+          type: string
+          enum: [available, booked]
+          description: Удобный enum для UI share-страницы
+
+    PublicBookingStatusResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/PublicGiftBookingStatus'
+
+    # --- Kafka event payloads (documentation only; not HTTP) ---
+    BookingCreatedEvent:
+      type: object
+      description: |
+        Published to `wishly.booking.events` after create.
+        Key: booking.id
+      required:
+        - event_type
+        - booking_id
+        - gift_id
+        - wishlist_id
+        - wishlist_owner_id
+        - booker_id
+        - gift_title
+        - booker_display_name
+        - occurred_at
+      properties:
+        event_type:
+          type: string
+          const: BookingCreated
+        booking_id:
+          type: string
+          format: uuid
+        gift_id:
+          type: string
+          format: uuid
+        wishlist_id:
+          type: string
+          format: uuid
+        wishlist_owner_id:
+          type: string
+          format: uuid
+        booker_id:
+          type: string
+          format: uuid
+        gift_title:
+          type: string
+        booker_display_name:
+          type: string
+        booking_deadline:
+          type: string
+          format: date-time
+        occurred_at:
+          type: string
+          format: date-time
+
+    BookingCancelledEvent:
+      type: object
+      description: |
+        Published to `wishly.booking.events` after cancel.
+        Key: booking.id
+      required:
+        - event_type
+        - booking_id
+        - gift_id
+        - wishlist_id
+        - wishlist_owner_id
+        - booker_id
+        - cancelled_by_id
+        - occurred_at
+      properties:
+        event_type:
+          type: string
+          const: BookingCancelled
+        booking_id:
+          type: string
+          format: uuid
+        gift_id:
+          type: string
+          format: uuid
+        wishlist_id:
+          type: string
+          format: uuid
+        wishlist_owner_id:
+          type: string
+          format: uuid
+        booker_id:
+          type: string
+          format: uuid
+        cancelled_by_id:
+          type: string
+          format: uuid
+        gift_title:
+          type: string
+        booker_display_name:
+          type: string
+        occurred_at:
+          type: string
+          format: date-time
+
+    NotificationRequestedEvent:
+      type: object
+      description: |
+        Published to `wishly.notification.commands` for in-app + email side-effects.
+      required:
+        - event_type
+        - type
+        - recipient_id
+        - payload
+        - channels
+        - occurred_at
+      properties:
+        event_type:
+          type: string
+          const: NotificationRequested
+        type:
+          type: string
+          enum: [booking_created, booking_cancelled]
+        recipient_id:
+          type: string
+          format: uuid
+          description: Обычно wishlist owner; при отмене Admin/Owner — также booker
+        recipient_email:
+          type: string
+          format: email
+        channels:
+          type: array
+          items:
+            type: string
+            enum: [in_app, email]
+        payload:
+          type: object
+          required: [wishlist_id, gift_id, booker_id, booking_id]
+          properties:
+            wishlist_id:
+              type: string
+              format: uuid
+            gift_id:
+              type: string
+              format: uuid
+            booker_id:
+              type: string
+              format: uuid
+            booking_id:
+              type: string
+              format: uuid
+            gift_title:
+              type: string
+            booker_display_name:
+              type: string
+        occurred_at:
+          type: string
+          format: date-time
+
+security:
+  - bearerAuth: []

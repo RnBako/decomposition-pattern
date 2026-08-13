@@ -1,0 +1,559 @@
+openapi: 3.1.0
+info:
+  title: Wishly API Gateway
+  version: 1.0.0
+  description: |
+    Single entry point for the Wishly SPA. Browser calls `{origin}/api/*`
+    (frontend nginx or Vite proxy → gateway `:8080` on the Docker network).
+
+    ## Routing (upstream)
+
+    | Gateway prefix | Upstream | Strip / rewrite |
+    |----------------|----------|-----------------|
+    | `/api/auth/*` | `http://auth-service:3001` | `/api` → service paths `/auth/*` |
+    | `/api/wishlists/*` | `http://wishlist-service:3002` | `/api` → `/wishlists/*` |
+    | `/api/share/*` | `http://wishlist-service:3002` | `/api` → `/share/*` |
+    | `/api/media/*` | `http://wishlist-service:3002` | `/api` → `/media/*` (static images) |
+    | `/api/bookings/*` | `http://booking-service:3003` | `/api` → `/bookings/*` |
+    | `/api/admin/bookings/*` | `http://booking-service:3003` | `/api` → `/admin/bookings/*` |
+    | `/api/notifications/*` | `http://notification-service:3004` | `/api` → `/notifications/*` |
+    | `/health` | gateway local | not proxied |
+
+    Canonical service contracts: `docs/{auth,wishlist,booking,notification}-service/api.yaml`.
+    This file is the **routing / edge** contract for implementers (DevOps + gateway).
+
+    ## Auth (JWT)
+
+    Default: `bearerAuth` (JWT) required on `/api/*`.
+
+    **Public (no JWT):**
+    - `GET /health`
+    - `POST /api/auth/register`
+    - `POST /api/auth/login`
+    - `GET /api/share/{token}`
+    - `GET /api/media/{storageKey}` (gift images)
+    - `GET /api/bookings/status` (occupancy without booker PII; optional auth)
+
+    After validating JWT, gateway MAY forward `Authorization: Bearer …` and/or
+    inject `X-User-Id`, `X-User-Role`, `X-User-Email`, `X-User-Display-Name` to upstreams.
+
+    ## CORS (localhost SPA)
+
+    Allow browser origins used in MVP, e.g.:
+    - `http://localhost:5173` (Vite)
+    - `http://localhost:3000` / `http://localhost` (nginx SPA)
+
+    Methods: `GET, POST, PATCH, PUT, DELETE, OPTIONS`.
+    Headers: `Authorization`, `Content-Type`, `Accept`.
+    Credentials: as needed for cookie-less Bearer SPA (usually `false` if token in memory/localStorage).
+    Preflight (`OPTIONS`) must succeed without JWT.
+
+    ## Media / static
+
+    Gift images stored on wishlist-service Docker volume are exposed only via
+    `GET /api/media/{storageKey}` → wishlist-service `GET /media/{storageKey}`.
+    Multipart upload remains on protected
+    `POST /api/wishlists/{wishlistId}/gifts/{giftId}/image`.
+
+x-gateway-routes:
+  - id: gateway-health
+    match: { path: /health, methods: [GET] }
+    upstream: local
+    auth: public
+  - id: auth
+    match: { pathPrefix: /api/auth/ }
+    upstream: http://auth-service:3001
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+    authExceptions:
+      - { path: /api/auth/register, methods: [POST] }
+      - { path: /api/auth/login, methods: [POST] }
+  - id: wishlists
+    match: { pathPrefix: /api/wishlists/ }
+    upstream: http://wishlist-service:3002
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+  - id: wishlists-collection
+    match: { path: /api/wishlists, methods: [GET, POST] }
+    upstream: http://wishlist-service:3002
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+  - id: share
+    match: { pathPrefix: /api/share/ }
+    upstream: http://wishlist-service:3002
+    pathRewrite: { stripPrefix: /api }
+    auth: public
+  - id: media
+    match: { pathPrefix: /api/media/ }
+    upstream: http://wishlist-service:3002
+    pathRewrite: { stripPrefix: /api }
+    auth: public
+    note: Proxy binary image responses (jpeg/png/webp)
+  - id: bookings
+    match: { pathPrefix: /api/bookings/ }
+    upstream: http://booking-service:3003
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+    authExceptions:
+      - { path: /api/bookings/status, methods: [GET] }
+  - id: bookings-collection
+    match: { path: /api/bookings, methods: [GET, POST] }
+    upstream: http://booking-service:3003
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+  - id: admin-bookings
+    match: { pathPrefix: /api/admin/bookings }
+    upstream: http://booking-service:3003
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+    requiredRole: admin
+  - id: notifications
+    match: { pathPrefix: /api/notifications }
+    upstream: http://notification-service:3004
+    pathRewrite: { stripPrefix: /api }
+    auth: jwt
+
+servers:
+  - url: http://localhost:8080
+    description: Local API Gateway (direct debug — not the SPA origin in production)
+  - url: http://localhost/api
+    description: Via frontend nginx (SPA same-origin /api proxy) — illustrative
+
+tags:
+  - name: Gateway
+  - name: Auth
+  - name: Wishlists
+  - name: Share
+  - name: Media
+  - name: Bookings
+  - name: Admin
+  - name: Notifications
+
+paths:
+  /health:
+    get:
+      tags: [Gateway]
+      summary: Gateway health
+      operationId: gatewayHealth
+      security: []
+      responses:
+        '200':
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  # ─── auth-service ─────────────────────────────────────────────────────────
+  /api/auth/register:
+    post:
+      tags: [Auth]
+      summary: Register (public)
+      description: Proxied to auth-service `POST /auth/register`.
+      operationId: gatewayRegister
+      security: []
+      x-upstream: http://auth-service:3001
+      x-upstream-path: /auth/register
+      responses:
+        '201':
+          description: Created + access JWT
+        '400':
+          description: Validation error
+        '409':
+          description: Email already registered
+
+  /api/auth/login:
+    post:
+      tags: [Auth]
+      summary: Login (public)
+      description: Proxied to auth-service `POST /auth/login`.
+      operationId: gatewayLogin
+      security: []
+      x-upstream: http://auth-service:3001
+      x-upstream-path: /auth/login
+      responses:
+        '200':
+          description: Access JWT
+        '401':
+          description: Invalid credentials
+
+  /api/auth/{proxy+}:
+    x-upstream: http://auth-service:3001
+    x-upstream-path-prefix: /auth/
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Remaining path under `/api/auth/` → upstream `/auth/{proxy}`.
+          Examples: `logout`, `me`, `users/{id}`.
+    get:
+      tags: [Auth]
+      summary: Proxy GET to auth-service
+      operationId: proxyAuthGet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Missing or invalid JWT
+    post:
+      tags: [Auth]
+      summary: Proxy POST to auth-service
+      operationId: proxyAuthPost
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '204':
+          description: Proxied empty success
+        '401':
+          description: Missing or invalid JWT
+
+  # ─── wishlist-service ─────────────────────────────────────────────────────
+  /api/wishlists:
+    x-upstream: http://wishlist-service:3002
+    x-upstream-path: /wishlists
+    get:
+      tags: [Wishlists]
+      summary: List my wishlists
+      operationId: gatewayListWishlists
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Wishlist list
+        '401':
+          description: Unauthorized
+    post:
+      tags: [Wishlists]
+      summary: Create wishlist
+      operationId: gatewayCreateWishlist
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Created
+        '401':
+          description: Unauthorized
+
+  /api/wishlists/{proxy+}:
+    x-upstream: http://wishlist-service:3002
+    x-upstream-path-prefix: /wishlists/
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Catch-all under `/api/wishlists/` → upstream `/wishlists/{proxy}`.
+          Covers categories, gifts, image upload, share-link, comments, restore, soft-delete.
+    get:
+      tags: [Wishlists]
+      summary: Proxy GET to wishlist-service
+      operationId: proxyWishlistsGet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+    post:
+      tags: [Wishlists]
+      summary: Proxy POST to wishlist-service
+      operationId: proxyWishlistsPost
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '201':
+          description: Created
+        '401':
+          description: Unauthorized
+    patch:
+      tags: [Wishlists]
+      summary: Proxy PATCH to wishlist-service
+      operationId: proxyWishlistsPatch
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+    delete:
+      tags: [Wishlists]
+      summary: Proxy DELETE to wishlist-service
+      operationId: proxyWishlistsDelete
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Soft-deleted / deleted
+        '401':
+          description: Unauthorized
+
+  /api/share/{token}:
+    get:
+      tags: [Share]
+      summary: Public wishlist by share token
+      description: |
+        Public. Proxied to wishlist-service `GET /share/{token}`.
+        No booker names / comments. Occupancy may be enriched via BFF + booking-service.
+      operationId: gatewayGetPublicShare
+      security: []
+      x-upstream: http://wishlist-service:3002
+      x-upstream-path: /share/{token}
+      parameters:
+        - name: token
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 16
+            maxLength: 128
+      responses:
+        '200':
+          description: Public share view
+        '404':
+          description: Invalid or revoked token
+
+  /api/media/{storageKey}:
+    get:
+      tags: [Media]
+      summary: Serve gift image (static proxy)
+      description: |
+        Public media proxy → wishlist-service `GET /media/{storageKey}`.
+        Binary jpeg/png/webp from Docker volume.
+      operationId: gatewayGetMedia
+      security: []
+      x-upstream: http://wishlist-service:3002
+      x-upstream-path: /media/{storageKey}
+      parameters:
+        - name: storageKey
+          in: path
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 512
+      responses:
+        '200':
+          description: Image bytes
+          content:
+            image/jpeg:
+              schema:
+                type: string
+                format: binary
+            image/png:
+              schema:
+                type: string
+                format: binary
+            image/webp:
+              schema:
+                type: string
+                format: binary
+        '404':
+          description: Not found
+
+  # ─── booking-service ──────────────────────────────────────────────────────
+  /api/bookings:
+    x-upstream: http://booking-service:3003
+    x-upstream-path: /bookings
+    get:
+      tags: [Bookings]
+      summary: List bookings by wishlist (owner/admin)
+      operationId: gatewayListBookingsByWishlist
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Bookings with booker identity
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+    post:
+      tags: [Bookings]
+      summary: Create booking
+      operationId: gatewayCreateBooking
+      security:
+        - bearerAuth: []
+      responses:
+        '201':
+          description: Created
+        '401':
+          description: Unauthorized
+        '409':
+          description: Gift already booked
+
+  /api/bookings/status:
+    get:
+      tags: [Bookings]
+      summary: Public occupancy by gift ids
+      description: |
+        Public (auth optional). Proxied to booking-service `GET /bookings/status`.
+        No booker PII.
+      operationId: gatewayGetPublicBookingStatus
+      security: []
+      x-upstream: http://booking-service:3003
+      x-upstream-path: /bookings/status
+      responses:
+        '200':
+          description: Status map without booker names
+        '400':
+          description: Bad request
+
+  /api/bookings/{proxy+}:
+    x-upstream: http://booking-service:3003
+    x-upstream-path-prefix: /bookings/
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Catch-all under `/api/bookings/` → upstream `/bookings/{proxy}`.
+          Examples: `me`, `{bookingId}/cancel`. (`status` is declared explicitly above as public.)
+    get:
+      tags: [Bookings]
+      summary: Proxy GET to booking-service
+      operationId: proxyBookingsGet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+    post:
+      tags: [Bookings]
+      summary: Proxy POST to booking-service
+      operationId: proxyBookingsPost
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+
+  /api/admin/bookings:
+    get:
+      tags: [Admin]
+      summary: Admin list bookings
+      description: Requires JWT with `role=admin`. → booking-service `GET /admin/bookings`.
+      operationId: gatewayAdminListBookings
+      security:
+        - bearerAuth: []
+      x-upstream: http://booking-service:3003
+      x-upstream-path: /admin/bookings
+      x-required-role: admin
+      responses:
+        '200':
+          description: Admin booking list
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden (not admin)
+
+  /api/admin/bookings/{proxy+}:
+    x-upstream: http://booking-service:3003
+    x-upstream-path-prefix: /admin/bookings/
+    x-required-role: admin
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+        description: e.g. `{bookingId}/cancel`
+    post:
+      tags: [Admin]
+      summary: Proxy POST admin bookings
+      operationId: proxyAdminBookingsPost
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+        '403':
+          description: Forbidden
+
+  # ─── notification-service ─────────────────────────────────────────────────
+  /api/notifications:
+    get:
+      tags: [Notifications]
+      summary: List my notifications
+      operationId: gatewayListNotifications
+      security:
+        - bearerAuth: []
+      x-upstream: http://notification-service:3004
+      x-upstream-path: /notifications
+      responses:
+        '200':
+          description: Notification list
+        '401':
+          description: Unauthorized
+
+  /api/notifications/{proxy+}:
+    x-upstream: http://notification-service:3004
+    x-upstream-path-prefix: /notifications/
+    parameters:
+      - name: proxy
+        in: path
+        required: true
+        schema:
+          type: string
+        description: |
+          Examples: `unread-count`, `read-all`, `{notificationId}/read`.
+    get:
+      tags: [Notifications]
+      summary: Proxy GET to notification-service
+      operationId: proxyNotificationsGet
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+    post:
+      tags: [Notifications]
+      summary: Proxy POST to notification-service
+      operationId: proxyNotificationsPost
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Proxied response
+        '401':
+          description: Unauthorized
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access JWT from auth-service. Claims (min): `sub` (user UUID), `email`,
+        `role` (`user`|`admin`), `display_name`. Gateway validates signature/exp
+        on protected routes before proxying.
+
+security:
+  - bearerAuth: []

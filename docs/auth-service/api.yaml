@@ -1,0 +1,293 @@
+openapi: 3.1.0
+info:
+  title: auth-service API
+  version: 1.0.0
+  description: |
+    Identity & Access (Wishly). Регистрация, вход, текущий пользователь, выдача JWT.
+    Роль `admin` создаётся только seed при старте сервиса из env:
+    `ADMIN_EMAIL`, `ADMIN_PASSWORD`, `ADMIN_DISPLAY_NAME` (регистрация всегда `role=user`).
+    Публикует событие `UserRegistered` в `wishly.auth.events` после успешной регистрации.
+    Gateway: `/api/auth/*` → этот сервис; JWT проверяется на периметре gateway.
+
+servers:
+  - url: http://localhost:3001
+    description: auth-service (local, без gateway-префикса /api)
+
+paths:
+  /health:
+    get:
+      summary: Проверка здоровья сервиса
+      operationId: getHealth
+      security: []
+      tags:
+        - System
+      responses:
+        '200':
+          description: Сервис доступен
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+
+  /auth/register:
+    post:
+      summary: Регистрация пользователя (role=user)
+      operationId: register
+      security: []
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RegisterRequest'
+      responses:
+        '201':
+          description: Аккаунт создан; выдан access JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '400':
+          description: Ошибка валидации
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Email уже зарегистрирован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/login:
+    post:
+      summary: Вход по email и паролю
+      operationId: login
+      security: []
+      tags:
+        - Auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Успешный вход; выдан access JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AuthResponse'
+        '401':
+          description: Неверные учётные данные (без лишних деталей)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/logout:
+    post:
+      summary: Выход (инвалидация клиентского JWT / best-effort revoke)
+      operationId: logout
+      tags:
+        - Auth
+      security:
+        - bearerAuth: []
+      responses:
+        '204':
+          description: Выход выполнен (клиент обязан удалить токен)
+        '401':
+          description: Нет или невалидный JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/me:
+    get:
+      summary: Текущий пользователь по JWT
+      operationId: getMe
+      tags:
+        - Auth
+      security:
+        - bearerAuth: []
+      responses:
+        '200':
+          description: Профиль текущего пользователя
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPublic'
+        '401':
+          description: Нет или невалидный JWT
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/users/{id}:
+    get:
+      summary: Пользователь по id (internal / gateway)
+      description: |
+        Для BFF/gateway и внутренних сервисов: snapshot `display_name` / `email` / `role`
+        по логическому UUID. Без кросс-сервисных FK. Не для публичного SPA без прав.
+      operationId: getUserById
+      tags:
+        - Users
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: UUID пользователя
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Пользователь найден
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserPublic'
+        '401':
+          description: Нет или невалидный JWT / внутренний вызов не авторизован
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Пользователь не найден или soft-deleted
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        Access JWT. Claims (минимум): `sub` = user id (UUID), `email`, `role` (`user`|`admin`),
+        `display_name`. Gateway может пробрасывать `X-User-Id`, `X-User-Role`.
+
+  schemas:
+    HealthResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          type: string
+          example: ok
+
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Код или короткое сообщение для UI
+        message:
+          type: string
+          description: Человекочитаемое описание (RU)
+
+    RegisterRequest:
+      type: object
+      required:
+        - email
+        - password
+        - display_name
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          format: password
+          minLength: 8
+          maxLength: 128
+          description: Пароль в открытом виде только в запросе; в БД — password_hash
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 120
+
+    LoginRequest:
+      type: object
+      required:
+        - email
+        - password
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    UserRole:
+      type: string
+      enum:
+        - user
+        - admin
+
+    UserPublic:
+      type: object
+      required:
+        - id
+        - email
+        - display_name
+        - role
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        display_name:
+          type: string
+        role:
+          $ref: '#/components/schemas/UserRole'
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    AuthResponse:
+      type: object
+      required:
+        - access_token
+        - token_type
+        - user
+      properties:
+        access_token:
+          type: string
+          description: JWT Bearer access token
+        token_type:
+          type: string
+          enum:
+            - Bearer
+          default: Bearer
+        expires_in:
+          type: integer
+          description: TTL токена в секундах
+          example: 86400
+        user:
+          $ref: '#/components/schemas/UserPublic'
+
+security:
+  - bearerAuth: []
